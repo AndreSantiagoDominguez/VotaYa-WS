@@ -3,8 +3,10 @@ const { WebSocketServer } = require("ws");
 const PORT = process.env.PORT || 3000;
 const wss = new WebSocketServer({ port: PORT });
 
+// ── Almacén de salas en memoria ──
 const rooms = new Map();
 
+// ── Utilidad: generar código de sala (6 caracteres) ──
 function generateRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "";
@@ -14,13 +16,14 @@ function generateRoomCode() {
   return rooms.has(code) ? generateRoomCode() : code;
 }
 
+// ── Utilidad: enviar mensaje JSON a un cliente ──
 function send(ws, data) {
   if (ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify(data));
   }
 }
 
-
+// ── Utilidad: broadcast a todos los clientes de una sala ──
 function broadcastToRoom(roomCode, data) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -86,7 +89,7 @@ function handleCreatePoll(ws, msg) {
       text: opt,
       votes: 0,
     })),
-    voters: new Map(), // voterId -> optionIndex
+    voters: new Map(),
     clients: new Set([ws]),
     creatorWs: ws,
     isOpen: true,
@@ -109,6 +112,7 @@ function handleCreatePoll(ws, msg) {
   console.log(`Sala ${roomCode} creada: "${title}" con ${options.length} opciones`);
 }
 
+// ── Unirse a sala ──
 function handleJoinRoom(ws, msg) {
   const { roomCode } = msg;
 
@@ -144,16 +148,72 @@ function handleJoinRoom(ws, msg) {
   console.log(`Cliente se unió a sala ${roomCode} (${room.clients.size} conectados)`);
 }
 
-
+// ── Votar ──
 function handleCastVote(ws, msg) {
-  send(ws, { type: "error", message: "cast_vote aún no implementado" });
+  const { roomCode, optionIndex, voterId } = msg;
+
+  // Validar campos requeridos
+  if (!roomCode || optionIndex === undefined || !voterId) {
+    return send(ws, {
+      type: "error",
+      message: "Se requiere roomCode, optionIndex y voterId",
+    });
+  }
+
+  const room = rooms.get(roomCode.toUpperCase());
+
+  // Validar que la sala existe
+  if (!room) {
+    return send(ws, { type: "vote_rejected", reason: "room_not_found" });
+  }
+
+  // Validar que la encuesta sigue abierta
+  if (!room.isOpen) {
+    return send(ws, { type: "vote_rejected", reason: "poll_closed" });
+  }
+
+  // Validar que la opción existe
+  if (optionIndex < 0 || optionIndex >= room.options.length) {
+    return send(ws, { type: "vote_rejected", reason: "invalid_option" });
+  }
+
+  // Validar que no haya votado antes
+  if (room.voters.has(voterId)) {
+    return send(ws, { type: "vote_rejected", reason: "already_voted" });
+  }
+
+  // Registrar voto
+  room.voters.set(voterId, optionIndex);
+  room.options[optionIndex].votes += 1;
+
+  // Confirmar al votante
+  send(ws, {
+    type: "vote_confirmed",
+    optionIndex,
+    voterId,
+  });
+
+  // Broadcast de resultados actualizados a toda la sala
+  broadcastToRoom(room.roomCode, {
+    type: "vote_update",
+    options: room.options,
+    totalVoters: room.voters.size,
+  });
+
+  console.log(
+    `Voto en sala ${roomCode}: opción ${optionIndex} (${room.voters.size} votos totales)`
+  );
 }
 
+// ── Handlers pendientes ──
+
 function handleClosePoll(ws, msg) {
+  // TODO: ULISES-2
   send(ws, { type: "error", message: "close_poll aún no implementado" });
 }
 
 function handleDisconnect(ws) {
+  // TODO: ULISES-2
   console.log("Cliente desconectado");
 }
 
