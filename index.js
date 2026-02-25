@@ -3,8 +3,10 @@ const { WebSocketServer } = require("ws");
 const PORT = process.env.PORT || 3000;
 const wss = new WebSocketServer({ port: PORT });
 
+// ── Almacén de salas en memoria ──
 const rooms = new Map();
 
+// ── Utilidad: generar código de sala (6 caracteres) ──
 function generateRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "";
@@ -14,13 +16,14 @@ function generateRoomCode() {
   return rooms.has(code) ? generateRoomCode() : code;
 }
 
+// ── Utilidad: enviar mensaje JSON a un cliente ──
 function send(ws, data) {
   if (ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify(data));
   }
 }
 
-
+// ── Utilidad: broadcast a todos los clientes de una sala ──
 function broadcastToRoom(roomCode, data) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -41,7 +44,6 @@ wss.on("connection", (ws) => {
       return send(ws, { type: "error", message: "JSON inválido" });
     }
 
-    // ── Router de mensajes ──
     switch (msg.type) {
       case "create_poll":
         handleCreatePoll(ws, msg);
@@ -86,7 +88,7 @@ function handleCreatePoll(ws, msg) {
       text: opt,
       votes: 0,
     })),
-    voters: new Map(), // voterId -> optionIndex
+    voters: new Map(),
     clients: new Set([ws]),
     creatorWs: ws,
     isOpen: true,
@@ -109,6 +111,7 @@ function handleCreatePoll(ws, msg) {
   console.log(`Sala ${roomCode} creada: "${title}" con ${options.length} opciones`);
 }
 
+// ── Unirse a sala ──
 function handleJoinRoom(ws, msg) {
   const { roomCode } = msg;
 
@@ -144,17 +147,136 @@ function handleJoinRoom(ws, msg) {
   console.log(`Cliente se unió a sala ${roomCode} (${room.clients.size} conectados)`);
 }
 
-
+// ── Votar ──
 function handleCastVote(ws, msg) {
-  send(ws, { type: "error", message: "cast_vote aún no implementado" });
+  const { roomCode, optionIndex, voterId } = msg;
+
+  if (!roomCode || optionIndex === undefined || !voterId) {
+    return send(ws, {
+      type: "error",
+      message: "Se requiere roomCode, optionIndex y voterId",
+    });
+  }
+
+  const room = rooms.get(roomCode.toUpperCase());
+
+  if (!room) {
+    return send(ws, { type: "vote_rejected", reason: "room_not_found" });
+  }
+
+  if (!room.isOpen) {
+    return send(ws, { type: "vote_rejected", reason: "poll_closed" });
+  }
+
+  if (optionIndex < 0 || optionIndex >= room.options.length) {
+    return send(ws, { type: "vote_rejected", reason: "invalid_option" });
+  }
+
+  if (room.voters.has(voterId)) {
+    return send(ws, { type: "vote_rejected", reason: "already_voted" });
+  }
+
+  room.voters.set(voterId, optionIndex);
+  room.options[optionIndex].votes += 1;
+
+  send(ws, {
+    type: "vote_confirmed",
+    optionIndex,
+    voterId,
+  });
+
+  broadcastToRoom(room.roomCode, {
+    type: "vote_update",
+    options: room.options,
+    totalVoters: room.voters.size,
+  });
+
+  console.log(
+    `Voto en sala ${roomCode}: opción ${optionIndex} (${room.voters.size} votos totales)`
+  );
 }
 
+// ── Cerrar encuesta ──
 function handleClosePoll(ws, msg) {
-  send(ws, { type: "error", message: "close_poll aún no implementado" });
+  const { roomCode } = msg;
+
+  if (!roomCode) {
+    return send(ws, { type: "error", message: "Se requiere roomCode" });
+  }
+
+  const room = rooms.get(roomCode.toUpperCase());
+
+  if (!room) {
+    return send(ws, { type: "error", message: "Sala no encontrada" });
+  }
+
+  // Solo el creador puede cerrar la encuesta
+  if (room.creatorWs !== ws) {
+    return send(ws, {
+      type: "error",
+      message: "Solo el creador puede cerrar la encuesta",
+    });
+  }
+
+  if (!room.isOpen) {
+    return send(ws, { type: "error", message: "La encuesta ya está cerrada" });
+  }
+
+  room.isOpen = false;
+
+  // Broadcast de resultados finales a toda la sala
+  broadcastToRoom(room.roomCode, {
+    type: "poll_closed",
+    finalResults: room.options,
+    totalVoters: room.voters.size,
+  });
+
+  console.log(
+    `Encuesta cerrada en sala ${roomCode} (${room.voters.size} votos totales)`
+  );
 }
 
+// ── Desconexión de cliente ──
 function handleDisconnect(ws) {
-  console.log("Cliente desconectado");
+  const roomCode = ws.roomCode;
+  if (!roomCode) return;
+
+  const room = rooms.get(roomCode);
+  if (!room) return;
+
+  // Remover cliente de la sala
+  room.clients.delete(ws);
+
+  // Si el creador se desconecta, cerrar la encuesta automáticamente
+  if (room.creatorWs === ws && room.isOpen) {
+    room.isOpen = false;
+    broadcastToRoom(roomCode, {
+      type: "poll_closed",
+      finalResults: room.options,
+      totalVoters: room.voters.size,
+    });
+    console.log(`Creador desconectado, encuesta cerrada en sala ${roomCode}`);
+  }
+
+  // Notificar a los demás cuántos quedan
+  if (room.clients.size > 0) {
+    broadcastToRoom(roomCode, {
+      type: "client_count",
+      count: room.clients.size,
+    });
+  }
+
+  // Si no quedan clientes, eliminar la sala después de 5 minutos
+  if (room.clients.size === 0) {
+    setTimeout(() => {
+      if (rooms.has(roomCode) && rooms.get(roomCode).clients.size === 0) {
+        rooms.delete(roomCode);
+        console.log(`Sala ${roomCode} eliminada por inactividad`);
+      }
+    }, 5 * 60 * 1000);
+  }
+
+  console.log(`Cliente desconectado de sala ${roomCode} (${room.clients.size} restantes)`);
 }
 
 console.log(`VotaYa WS corriendo en puerto ${PORT}`);
