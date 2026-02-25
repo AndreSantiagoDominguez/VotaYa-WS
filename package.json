@@ -1,0 +1,13 @@
+{
+  "name": "votaya-ws",
+  "version": "1.0.0",
+  "description": "VotaYa — WebSocket server para votaciones en tiempo real",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
