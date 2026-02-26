@@ -1,12 +1,31 @@
+require("dotenv").config();
+const express = require("express");
+const http = require("http");
 const { WebSocketServer } = require("ws");
+const jwt = require("jsonwebtoken");
+const url = require("url");
+const authRoutes = require("./auth/routes");
+const db = require("./auth/db");
 
-const PORT = process.env.PORT || 3000;
-const wss = new WebSocketServer({ port: PORT });
+const PORT = process.env.PORT;
+const JWT_SECRET = process.env.JWT_SECRET;
 
-// ── Almacén de salas en memoria ──
+const app = express();
+app.use(express.json());
+
+app.use(authRoutes);
+
+app.get("/health", async (req, res) => {
+  const userCount = await db.getUserCount();
+  res.json({ status: "ok", users: userCount, rooms: rooms.size });
+});
+
+const server = http.createServer(app);
+
+const wss = new WebSocketServer({ server });
+
 const rooms = new Map();
 
-// ── Utilidad: generar código de sala (6 caracteres) ──
 function generateRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "";
@@ -16,14 +35,12 @@ function generateRoomCode() {
   return rooms.has(code) ? generateRoomCode() : code;
 }
 
-// ── Utilidad: enviar mensaje JSON a un cliente ──
 function send(ws, data) {
   if (ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify(data));
   }
 }
 
-// ── Utilidad: broadcast a todos los clientes de una sala ──
 function broadcastToRoom(roomCode, data) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -32,9 +49,37 @@ function broadcastToRoom(roomCode, data) {
   }
 }
 
-// ── Conexión de un nuevo cliente ──
-wss.on("connection", (ws) => {
-  console.log("Cliente conectado");
+function authenticateWs(req) {
+  try {
+    const params = url.parse(req.url, true).query;
+    const token = params.token;
+    if (!token) return null;
+    return jwt.verify(token, JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+
+wss.on("connection", (ws, req) => {
+  const userData = authenticateWs(req);
+
+  if (!userData) {
+    send(ws, { type: "auth_error", message: "Token inválido o no proporcionado" });
+    ws.close();
+    return;
+  }
+
+  ws.userId = userData.id;
+  ws.userName = userData.name;
+  ws.userEmail = userData.email;
+
+  send(ws, {
+    type: "authenticated",
+    user: { id: userData.id, name: userData.name },
+  });
+
+  console.log(`Cliente autenticado: ${ws.userName} (${ws.userId})`);
 
   ws.on("message", (raw) => {
     let msg;
@@ -67,7 +112,7 @@ wss.on("connection", (ws) => {
   });
 });
 
-// ── Crear encuesta ──
+
 function handleCreatePoll(ws, msg) {
   const { title, options } = msg;
 
@@ -90,7 +135,8 @@ function handleCreatePoll(ws, msg) {
     })),
     voters: new Map(),
     clients: new Set([ws]),
-    creatorWs: ws,
+    creatorId: ws.userId,
+    creatorName: ws.userName,
     isOpen: true,
     createdAt: Date.now(),
   };
@@ -105,13 +151,13 @@ function handleCreatePoll(ws, msg) {
       title: room.title,
       options: room.options,
       isOpen: room.isOpen,
+      createdBy: room.creatorName,
     },
   });
 
-  console.log(`Sala ${roomCode} creada: "${title}" con ${options.length} opciones`);
+  console.log(`Sala ${roomCode} creada por ${ws.userName}: "${title}"`);
 }
 
-// ── Unirse a sala ──
 function handleJoinRoom(ws, msg) {
   const { roomCode } = msg;
 
@@ -136,28 +182,30 @@ function handleJoinRoom(ws, msg) {
       options: room.options,
       isOpen: room.isOpen,
       totalVoters: room.voters.size,
+      createdBy: room.creatorName,
     },
   });
 
   broadcastToRoom(room.roomCode, {
-    type: "client_count",
-    count: room.clients.size,
+    type: "user_joined",
+    userName: ws.userName,
+    clientCount: room.clients.size,
   });
 
-  console.log(`Cliente se unió a sala ${roomCode} (${room.clients.size} conectados)`);
+  console.log(`${ws.userName} se unió a sala ${roomCode} (${room.clients.size} conectados)`);
 }
 
-// ── Votar ──
 function handleCastVote(ws, msg) {
-  const { roomCode, optionIndex, voterId } = msg;
+  const { roomCode, optionIndex } = msg;
 
-  if (!roomCode || optionIndex === undefined || !voterId) {
+  if (!roomCode || optionIndex === undefined) {
     return send(ws, {
       type: "error",
-      message: "Se requiere roomCode, optionIndex y voterId",
+      message: "Se requiere roomCode y optionIndex",
     });
   }
 
+  const voterId = ws.userId;
   const room = rooms.get(roomCode.toUpperCase());
 
   if (!room) {
@@ -182,7 +230,7 @@ function handleCastVote(ws, msg) {
   send(ws, {
     type: "vote_confirmed",
     optionIndex,
-    voterId,
+    voterName: ws.userName,
   });
 
   broadcastToRoom(room.roomCode, {
@@ -192,11 +240,10 @@ function handleCastVote(ws, msg) {
   });
 
   console.log(
-    `Voto en sala ${roomCode}: opción ${optionIndex} (${room.voters.size} votos totales)`
+    `${ws.userName} votó en sala ${roomCode}: opción ${optionIndex} (${room.voters.size} votos totales)`
   );
 }
 
-// ── Cerrar encuesta ──
 function handleClosePoll(ws, msg) {
   const { roomCode } = msg;
 
@@ -210,8 +257,7 @@ function handleClosePoll(ws, msg) {
     return send(ws, { type: "error", message: "Sala no encontrada" });
   }
 
-  // Solo el creador puede cerrar la encuesta
-  if (room.creatorWs !== ws) {
+  if (room.creatorId !== ws.userId) {
     return send(ws, {
       type: "error",
       message: "Solo el creador puede cerrar la encuesta",
@@ -224,7 +270,6 @@ function handleClosePoll(ws, msg) {
 
   room.isOpen = false;
 
-  // Broadcast de resultados finales a toda la sala
   broadcastToRoom(room.roomCode, {
     type: "poll_closed",
     finalResults: room.options,
@@ -232,11 +277,10 @@ function handleClosePoll(ws, msg) {
   });
 
   console.log(
-    `Encuesta cerrada en sala ${roomCode} (${room.voters.size} votos totales)`
+    `Encuesta cerrada en sala ${roomCode} por ${ws.userName} (${room.voters.size} votos totales)`
   );
 }
 
-// ── Desconexión de cliente ──
 function handleDisconnect(ws) {
   const roomCode = ws.roomCode;
   if (!roomCode) return;
@@ -244,29 +288,26 @@ function handleDisconnect(ws) {
   const room = rooms.get(roomCode);
   if (!room) return;
 
-  // Remover cliente de la sala
   room.clients.delete(ws);
 
-  // Si el creador se desconecta, cerrar la encuesta automáticamente
-  if (room.creatorWs === ws && room.isOpen) {
+  if (room.creatorId === ws.userId && room.isOpen) {
     room.isOpen = false;
     broadcastToRoom(roomCode, {
       type: "poll_closed",
       finalResults: room.options,
       totalVoters: room.voters.size,
     });
-    console.log(`Creador desconectado, encuesta cerrada en sala ${roomCode}`);
+    console.log(`${ws.userName} (creador) desconectado, encuesta cerrada en sala ${roomCode}`);
   }
 
-  // Notificar a los demás cuántos quedan
   if (room.clients.size > 0) {
     broadcastToRoom(roomCode, {
-      type: "client_count",
-      count: room.clients.size,
+      type: "user_left",
+      userName: ws.userName,
+      clientCount: room.clients.size,
     });
   }
 
-  // Si no quedan clientes, eliminar la sala después de 5 minutos
   if (room.clients.size === 0) {
     setTimeout(() => {
       if (rooms.has(roomCode) && rooms.get(roomCode).clients.size === 0) {
@@ -276,7 +317,35 @@ function handleDisconnect(ws) {
     }, 5 * 60 * 1000);
   }
 
-  console.log(`Cliente desconectado de sala ${roomCode} (${room.clients.size} restantes)`);
+  console.log(`${ws.userName} desconectado de sala ${roomCode} (${room.clients.size} restantes)`);
 }
 
-console.log(`VotaYa WS corriendo en puerto ${PORT}`);
+const colors = {
+  reset: "\x1b[0m",
+  cyan: "\x1b[36m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
+  magenta: "\x1b[35m"
+};
+
+async function start() {
+  await db.initDB();
+  const userCount = await db.getUserCount();
+
+  server.listen(PORT, () => {
+    console.log(`\n${colors.green}🚀 ¡VotaYa Server inicializado con éxito!${colors.reset}\n`);
+    console.log(`  🌐 ${colors.magenta}HTTP${colors.reset}  → ${colors.cyan}http://localhost:${PORT}${colors.reset}`);
+    console.log(`  ⚡ ${colors.yellow}WS${colors.reset}    → ${colors.cyan}ws://localhost:${PORT}?token=JWT_TOKEN${colors.reset}`);
+    console.log(`  👥 ${colors.magenta}Users${colors.reset} → ${colors.green}${userCount}${colors.reset} registrados en MySQL\n`);
+    console.log(`${colors.yellow}📡 Escuchando peticiones...${colors.reset}`);
+  });
+}
+
+start().catch((err) => {
+  console.error(`\n${colors.red}❌ ¡Alerta Roja! Fallo crítico al iniciar el servidor.${colors.reset}\n`);
+  console.error(`💥 ${colors.red}Error:${colors.reset} ${err.message}`);
+  console.error(`🔍 ${colors.yellow}Pista de depuración:${colors.reset} ¿Está encendido el motor de MySQL en tu computadora?`);
+  console.error(`   Revisa tus variables: DB_HOST, DB_USER, DB_PASSWORD, DB_NAME en el archivo .env\n`);
+  process.exit(1);
+});
