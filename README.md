@@ -19,7 +19,7 @@ VotaYa-WS/
 
 - Node.js 18+
 - MySQL 8+ corriendo en localhost
-
+- Hola 
 ## Setup
 
 ```bash
