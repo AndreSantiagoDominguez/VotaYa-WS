@@ -1,0 +1,28 @@
+# Android Studio / IntelliJ
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Gradle
+.gradle/
+build/
+
+# Kotlin
+.kotlin/
+
+# Secrets
+**/google-services.json
+**/fabric.properties
+**/secrets.xml
+
+# System
+Captures/
+.DS_Store
+Thumbs.db
